@@ -1,0 +1,25 @@
+{
+  "name": "frameandreel-comps",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Poster valuation comps scrapers for Frame & Reel — eMoviePoster historical/current auctions, eBay, retail listings, Gemini estimates.",
+  "scripts": {
+    "scrape:emovieposter": "tsx scraper/emovieposter_scraper.ts",
+    "scrape:emovieposter:discover": "tsx scraper/emovieposter_scraper.ts --discover",
+    "scrape:current-auctions": "tsx scraper/emovieposter_current_auctions.ts",
+    "scrape:ebay": "tsx scraper/ebay_comps.ts",
+    "scrape:retail": "tsx scraper/retail_listings_scraper.ts",
+    "estimate:gemini": "tsx valuation/gemini_estimate.ts"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "rebrowser-playwright": "^1.47.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
