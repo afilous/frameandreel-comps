@@ -3,6 +3,12 @@ name: Poster Comps Scraper (Master)
 # Consolidated workflow — one place for all scraper variants instead of a
 # separate near-duplicate .yml per script. Pick the target and (for
 # emovieposter modes) supply titles or tags via inputs.
+#
+# NOTE: the scraper folder in this repo is capitalized "Scraper/" (not
+# "scraper/") — GitHub's Linux runners have a case-sensitive filesystem, so
+# every path below must match that exactly or the run fails with
+# ERR_MODULE_NOT_FOUND. If you ever rename the folder to lowercase, update
+# every "Scraper/" reference below (and in package.json) to match.
 
 on:
   workflow_dispatch:
@@ -12,11 +18,11 @@ on:
         required: true
         type: choice
         options:
-          - emovieposter-titles      # scraper/emovieposter_scraper.ts — precise per-title comps (needs login)
-          - emovieposter-discovery   # scraper/emovieposter_scraper.ts --discover — tag-based title discovery (needs login)
-          - emovieposter-current     # scraper/emovieposter_current_auctions.ts — live auctions to bid on (NO login needed)
-          - ebay-comps               # scraper/ebay_comps.ts
-          - retail-listings          # scraper/retail_listings_scraper.ts
+          - emovieposter-titles      # Scraper/emovieposter_scraper.ts — precise per-title comps (needs login)
+          - emovieposter-discovery   # Scraper/emovieposter_scraper.ts --discover — tag-based title discovery (needs login)
+          - emovieposter-current     # Scraper/emovieposter_current_auctions.ts — live auctions to bid on (NO login needed)
+          - ebay-comps               # Scraper/ebay_comps.ts
+          - retail-listings          # Scraper/retail_listings_scraper.ts
           - gemini-estimate          # valuation/gemini_estimate.ts
       titles:
         description: "OPTIONAL ad-hoc override — comma-separated titles. Leave blank to use the watchlist (bid_watchlist in Supabase) instead. Also used by ebay-comps/retail-listings."
@@ -52,7 +58,7 @@ on:
         default: ""
 
   # Auto-runs the current-auctions scraper only — Monday/Wednesday/Saturday,
-  # 13:00 UTC (~8am CDT), i.e. the day before each of the site's actual
+  # 13:00 UTC (~8am CDT), i.e. the day before each of eMoviePoster's actual
   # close days (Tuesday/Thursday/Sunday, confirmed). Does NOT run the
   # historical scraper — that needs login + direction (the watchlist),
   # not a blind timer. Adjust the cron below for a different cadence/time;
@@ -97,7 +103,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           TITLES: ${{ github.event.inputs.titles }}
-        run: npx tsx scraper/emovieposter_scraper.ts
+        run: npx tsx Scraper/emovieposter_scraper.ts
 
       - name: Run — eMoviePoster current auctions (no login needed)
         if: github.event_name == 'schedule' || github.event.inputs.target == 'emovieposter-current'
@@ -105,7 +111,7 @@ jobs:
           LISTING_URL: ${{ github.event.inputs.listing_url }}
           FRAMEANDREEL_INGEST_URL_CURRENT_AUCTIONS: ${{ secrets.FRAMEANDREEL_INGEST_URL_CURRENT_AUCTIONS }}
           FRAMEANDREEL_INGEST_KEY: ${{ secrets.FRAMEANDREEL_INGEST_KEY }}
-        run: npx tsx scraper/emovieposter_current_auctions.ts
+        run: npx tsx Scraper/emovieposter_current_auctions.ts
 
       - name: Run — eMoviePoster (tag discovery)
         if: github.event.inputs.target == 'emovieposter-discovery'
@@ -115,7 +121,7 @@ jobs:
           FRAMEANDREEL_INGEST_URL: ${{ secrets.FRAMEANDREEL_INGEST_URL }}
           FRAMEANDREEL_INGEST_KEY: ${{ secrets.FRAMEANDREEL_INGEST_KEY }}
           DISCOVERY_TAGS: ${{ github.event.inputs.discovery_tags }}
-        run: npx tsx scraper/emovieposter_scraper.ts --discover
+        run: npx tsx Scraper/emovieposter_scraper.ts --discover
 
       - name: Run — eBay comps (official API)
         if: github.event.inputs.target == 'ebay-comps'
@@ -125,7 +131,7 @@ jobs:
           FRAMEANDREEL_INGEST_URL: ${{ secrets.FRAMEANDREEL_INGEST_URL }}
           FRAMEANDREEL_INGEST_KEY: ${{ secrets.FRAMEANDREEL_INGEST_KEY }}
           TITLES: ${{ github.event.inputs.titles }}
-        run: npx tsx scraper/ebay_comps.ts
+        run: npx tsx Scraper/ebay_comps.ts
 
       - name: Run — retail listings (Posterarti / Film Art Gallery)
         if: github.event.inputs.target == 'retail-listings'
@@ -133,7 +139,7 @@ jobs:
           FRAMEANDREEL_INGEST_URL: ${{ secrets.FRAMEANDREEL_INGEST_URL }}
           FRAMEANDREEL_INGEST_KEY: ${{ secrets.FRAMEANDREEL_INGEST_KEY }}
           TITLES: ${{ github.event.inputs.titles }}
-        run: npx tsx scraper/retail_listings_scraper.ts
+        run: npx tsx Scraper/retail_listings_scraper.ts
 
       - name: Run — Gemini ballpark estimate
         if: github.event.inputs.target == 'gemini-estimate'
