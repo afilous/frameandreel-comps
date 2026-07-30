@@ -4,11 +4,11 @@
   "private": true,
   "description": "Poster valuation comps scrapers for Frame & Reel — eMoviePoster historical/current auctions, eBay, retail listings, Gemini estimates.",
   "scripts": {
-    "scrape:emovieposter": "tsx scraper/emovieposter_scraper.ts",
-    "scrape:emovieposter:discover": "tsx scraper/emovieposter_scraper.ts --discover",
-    "scrape:current-auctions": "tsx scraper/emovieposter_current_auctions.ts",
-    "scrape:ebay": "tsx scraper/ebay_comps.ts",
-    "scrape:retail": "tsx scraper/retail_listings_scraper.ts",
+    "scrape:emovieposter": "tsx Scraper/emovieposter_scraper.ts",
+    "scrape:emovieposter:discover": "tsx Scraper/emovieposter_scraper.ts --discover",
+    "scrape:current-auctions": "tsx Scraper/emovieposter_current_auctions.ts",
+    "scrape:ebay": "tsx Scraper/ebay_comps.ts",
+    "scrape:retail": "tsx Scraper/retail_listings_scraper.ts",
     "estimate:gemini": "tsx valuation/gemini_estimate.ts"
   },
   "dependencies": {
