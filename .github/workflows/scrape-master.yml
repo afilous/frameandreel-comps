@@ -1,0 +1,161 @@
+name: Poster Comps Scraper (Master)
+
+# Consolidated workflow — one place for all scraper variants instead of a
+# separate near-duplicate .yml per script. Pick the target and (for
+# emovieposter modes) supply titles or tags via inputs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Which scraper to run"
+        required: true
+        type: choice
+        options:
+          - emovieposter-titles      # scraper/emovieposter_scraper.ts — precise per-title comps (needs login)
+          - emovieposter-discovery   # scraper/emovieposter_scraper.ts --discover — tag-based title discovery (needs login)
+          - emovieposter-current     # scraper/emovieposter_current_auctions.ts — live auctions to bid on (NO login needed)
+          - ebay-comps               # scraper/ebay_comps.ts
+          - retail-listings          # scraper/retail_listings_scraper.ts
+          - gemini-estimate          # valuation/gemini_estimate.ts
+      titles:
+        description: "OPTIONAL ad-hoc override — comma-separated titles. Leave blank to use the watchlist (bid_watchlist in Supabase) instead. Also used by ebay-comps/retail-listings."
+        required: false
+        default: ""
+      discovery_tags:
+        description: "Comma-separated field:value tags (for emovieposter-discovery), e.g. 'star:Harrison Ford,special:Star Wars'"
+        required: false
+        default: ""
+      listing_url:
+        description: "For emovieposter-current — defaults to the 'All Auctions' listing, which aggregates every current auction and appears stable across cycles (no per-cycle ID). Override only if you want just one specific day."
+        required: false
+        default: "https://www.emovieposter.com/agallery/all.html"
+      # gemini-estimate single-item inputs
+      title:
+        description: "Single title (for gemini-estimate)"
+        required: false
+        default: ""
+      year:
+        required: false
+        default: ""
+      size:
+        required: false
+        default: ""
+      country:
+        required: false
+        default: ""
+      condition:
+        required: false
+        default: ""
+      style:
+        required: false
+        default: ""
+
+  # Auto-runs the current-auctions scraper only — Monday/Wednesday/Saturday,
+  # 13:00 UTC (~8am CDT), i.e. the day before each of the site's actual
+  # close days (Tuesday/Thursday/Sunday, confirmed). Does NOT run the
+  # historical scraper — that needs login + direction (the watchlist),
+  # not a blind timer. Adjust the cron below for a different cadence/time;
+  # cron time is UTC, so 13:00 UTC = 8am CDT / 7am CST depending on DST.
+  schedule:
+    - cron: '0 13 * * 1,3,6'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright browsers
+        if: github.event_name == 'schedule' || startsWith(github.event.inputs.target, 'emovieposter') || github.event.inputs.target == 'retail-listings'
+        run: npx playwright install --with-deps chromium
+
+      - name: Restore scraper state (checkpoint + session)
+        if: github.event_name == 'schedule' || startsWith(github.event.inputs.target, 'emovieposter') || github.event.inputs.target == 'retail-listings'
+        uses: actions/cache@v4
+        with:
+          path: .scraper-state
+          key: scraper-state-${{ github.event_name == 'schedule' && 'emovieposter-current' || github.event.inputs.target }}-${{ github.run_id }}
+          restore-keys: |
+            scraper-state-${{ github.event_name == 'schedule' && 'emovieposter-current' || github.event.inputs.target }}-
+
+      - name: Run — eMoviePoster (per-title)
+        if: github.event.inputs.target == 'emovieposter-titles'
+        env:
+          EMOVIEPOSTER_USERNAME: ${{ secrets.EMOVIEPOSTER_USERNAME }}
+          EMOVIEPOSTER_PASSWORD: ${{ secrets.EMOVIEPOSTER_PASSWORD }}
+          FRAMEANDREEL_INGEST_URL: ${{ secrets.FRAMEANDREEL_INGEST_URL }}
+          FRAMEANDREEL_INGEST_KEY: ${{ secrets.FRAMEANDREEL_INGEST_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          TITLES: ${{ github.event.inputs.titles }}
+        run: npx tsx scraper/emovieposter_scraper.ts
+
+      - name: Run — eMoviePoster current auctions (no login needed)
+        if: github.event_name == 'schedule' || github.event.inputs.target == 'emovieposter-current'
+        env:
+          LISTING_URL: ${{ github.event.inputs.listing_url }}
+          FRAMEANDREEL_INGEST_URL_CURRENT_AUCTIONS: ${{ secrets.FRAMEANDREEL_INGEST_URL_CURRENT_AUCTIONS }}
+          FRAMEANDREEL_INGEST_KEY: ${{ secrets.FRAMEANDREEL_INGEST_KEY }}
+        run: npx tsx scraper/emovieposter_current_auctions.ts
+
+      - name: Run — eMoviePoster (tag discovery)
+        if: github.event.inputs.target == 'emovieposter-discovery'
+        env:
+          EMOVIEPOSTER_USERNAME: ${{ secrets.EMOVIEPOSTER_USERNAME }}
+          EMOVIEPOSTER_PASSWORD: ${{ secrets.EMOVIEPOSTER_PASSWORD }}
+          FRAMEANDREEL_INGEST_URL: ${{ secrets.FRAMEANDREEL_INGEST_URL }}
+          FRAMEANDREEL_INGEST_KEY: ${{ secrets.FRAMEANDREEL_INGEST_KEY }}
+          DISCOVERY_TAGS: ${{ github.event.inputs.discovery_tags }}
+        run: npx tsx scraper/emovieposter_scraper.ts --discover
+
+      - name: Run — eBay comps (official API)
+        if: github.event.inputs.target == 'ebay-comps'
+        env:
+          EBAY_APP_ID: ${{ secrets.EBAY_APP_ID }}
+          EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
+          FRAMEANDREEL_INGEST_URL: ${{ secrets.FRAMEANDREEL_INGEST_URL }}
+          FRAMEANDREEL_INGEST_KEY: ${{ secrets.FRAMEANDREEL_INGEST_KEY }}
+          TITLES: ${{ github.event.inputs.titles }}
+        run: npx tsx scraper/ebay_comps.ts
+
+      - name: Run — retail listings (Posterarti / Film Art Gallery)
+        if: github.event.inputs.target == 'retail-listings'
+        env:
+          FRAMEANDREEL_INGEST_URL: ${{ secrets.FRAMEANDREEL_INGEST_URL }}
+          FRAMEANDREEL_INGEST_KEY: ${{ secrets.FRAMEANDREEL_INGEST_KEY }}
+          TITLES: ${{ github.event.inputs.titles }}
+        run: npx tsx scraper/retail_listings_scraper.ts
+
+      - name: Run — Gemini ballpark estimate
+        if: github.event.inputs.target == 'gemini-estimate'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FRAMEANDREEL_INGEST_URL_AI_ESTIMATES: ${{ secrets.FRAMEANDREEL_INGEST_URL_AI_ESTIMATES }}
+          FRAMEANDREEL_INGEST_KEY: ${{ secrets.FRAMEANDREEL_INGEST_KEY }}
+          TITLE: ${{ github.event.inputs.title }}
+          YEAR: ${{ github.event.inputs.year }}
+          SIZE: ${{ github.event.inputs.size }}
+          COUNTRY: ${{ github.event.inputs.country }}
+          CONDITION: ${{ github.event.inputs.condition }}
+          STYLE: ${{ github.event.inputs.style }}
+        run: npx tsx valuation/gemini_estimate.ts
+
+      # Capture logs/debug output even on failure
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-logs-${{ github.event_name == 'schedule' && 'emovieposter-current-scheduled' || github.event.inputs.target }}
+          path: |
+            *.log
+            screenshots/
+          if-no-files-found: ignore
