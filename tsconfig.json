@@ -9,5 +9,5 @@
     "resolveJsonModule": true,
     "types": ["node"]
   },
-  "include": ["scraper/**/*.ts", "valuation/**/*.ts"]
+  "include": ["Scraper/**/*.ts", "valuation/**/*.ts"]
 }
