@@ -4,64 +4,27 @@
  * (goal #2: historical realized sales for comps, which needs login — this
  * one does not).
  *
- * CONFIRMED (from real screenshots):
- *   - No login required.
- *   - Three separate, STABLE per-day category IDs (confirmed directly):
- *       Tuesday = 13, Thursday = 14, Sunday = 15
- *     URL pattern: https://www.emovieposter.com/agallery/mode/2/{id}.html
- *     (mode/2 = Text — no thumbnails, real <table> markup, lightest fetch;
- *     mode/0 = Grid is the default with thumbnails; mode/1 = List, also a
- *     real table but with thumbnails. Each mode has a DIFFERENT URL, not
- *     just a display toggle — confirmed directly.)
- *   - https://www.emovieposter.com/agallery/all.html — the "aggregate
- *     everything" page — returns a REAL page (confirmed via screenshot,
- *     2,069 items = Tuesday + Thursday combined) but the scraper found
- *     ZERO table rows on it in an actual run. Likely uses a different
- *     underlying template (div/card-based) than the per-day mode/2 pages,
- *     even though it displays similarly. NOT used as the default anymore
- *     — hitting the three known per-day IDs directly is more reliable.
- *   - Real table structure confirmed via visible header row, consistent
- *     across all per-day pages regardless of mode:
- *       Thumbnail | Auction Title/Condition Grade/High Bidder | Recent Price | Time Left | Bid
- *     5 columns. Column 2 packs title + condition grade + bidder status
- *     into one cell as multi-line text (not 3 separate cells) — parsed by
- *     splitting that cell's own text, not the whole page's.
- *   - No "Starting Price:"/"Recent Price:" labels — just a bare "$1.00" in
- *     its own column. Whether that's a starting price or an actual bid can
- *     only be inferred from the adjacent status line ("No Bids Yet" vs
- *     "High Bidder: {name}").
- *   - Item codes match the pattern seen everywhere on the site: digit +
- *     letter + 4 digits (e.g. "2f0083", "2f0229").
- *   - The duplicate-title-line artifact (an apostrophe splitting an <img>
- *     alt from a separate link's full text) still shows up within column
- *     2's own text — handled the same way as before (keep the longer line
- *     if one is a prefix of the other).
- *   - Items-per-page dropdown (40/80/120/160/200) is a real, separate
- *     per-mode setting — text mode showed 160 as the current selection in
- *     one screenshot vs 80 for grid mode, so this may reset per mode
- *     rather than persisting; not something this scraper controls, it
- *     just reads whatever the default renders.
+ * See git history / conversation for the full confirmed-structure notes.
+ * Short version: no login needed; three stable category IDs (Tuesday=13,
+ * Thursday=14, Sunday=15) at https://www.emovieposter.com/agallery/mode/2/{id}.html;
+ * confirmed via real screenshots to be a genuine <table> with columns
+ * Thumbnail | Auction Title/Condition Grade/High Bidder | Recent Price | Time Left | Bid.
  *
- * STILL OPEN:
- *   - Whether IDs 13/14/15 are truly PERMANENT (stable across many future
- *     auction cycles) or just happen to be stable right now — worth
- *     rechecking occasionally, especially around special/major auctions
- *     (the calendar mentioned "August Major Auction", "Elvis auction" etc.
- *     which might use different IDs than the regular weekly 13/14/15)
- *   - Real pagination URL pattern for these pages — not yet confirmed
- *     (does page 2 add a /page/{n}/ segment like the historical archive,
- *     or something else?) — still following the page's own "Next" link
- *     rather than guessing, which doesn't depend on knowing this
- *   - Whether Time Left actually appears in the DOM at scrape time, or is
- *     rendered by client-side JS after a delay — using 'networkidle' wait
- *     to be safe, but unverified
- *
- * Does NOT compute suggested_max_bid — that's the valuation engine's job,
- * comparing against poster_auctions history. This scraper only collects
- * what's currently up for bid. Read-only throughout: never places a bid.
+ * CURRENT PROBLEM: three consecutive real runs against these confirmed
+ * URLs all returned 0 items on every day, with no errors, no block-page
+ * detection triggering, and no timeouts — meaning page.goto() succeeds and
+ * $$eval("table tr", ...) finds nothing, despite screenshots showing real
+ * table content at these exact URLs. Added real diagnostics below (screenshot
+ * on zero-results, page title, raw HTML snippet, table-element count) since
+ * guessing at another cause blind hasn't been productive — the artifact
+ * upload / log output from the NEXT run should show what Playwright is
+ * actually seeing (e.g. a login wall, a different template, an empty shell
+ * page, a bot-check page our isBlockPage() keyword list doesn't catch).
  */
 
 import type { Page } from "playwright";
+import { promises as fs } from "fs";
+import path from "path";
 import {
   launchStealthBrowser,
   createSpoofedContext,
@@ -75,6 +38,7 @@ import {
 const ARCHIVE_BASE_URL = "https://www.emovieposter.com";
 const WARM_UP_SITES = ["https://www.google.com", "https://www.wikipedia.org"];
 const MAX_LISTING_PAGES = 40; // safety cap — real scale is ~10-12 pages per auction day
+const SCREENSHOTS_DIR = path.resolve(process.cwd(), "screenshots");
 
 // Confirmed stable category IDs — see header notes above.
 const DEFAULT_AUCTION_DAYS: Record<string, string> = {
@@ -148,6 +112,34 @@ function parseCombinedCell(cellText: string): {
   return { itemCode, titleRaw: dedupeTitleLines(titleLines), conditionGrade, highBidder };
 }
 
+// Diagnostics — runs whenever a page yields zero parsed rows, so we get
+// real visibility into what Playwright actually saw instead of guessing.
+async function logDiagnostics(page: Page, label: string): Promise<void> {
+  try {
+    const title = await page.title();
+    const url = page.url();
+    const tableCount = await page.$$eval("table", (tables) => tables.length);
+    const trCount = await page.$$eval("tr", (rows) => rows.length);
+    const bodyTextSnippet = (await page.textContent("body").catch(() => "")) ?? "";
+    const htmlLength = (await page.content()).length;
+
+    console.log(`  [DIAGNOSTIC ${label}]`);
+    console.log(`    final URL: ${url}`);
+    console.log(`    page title: "${title}"`);
+    console.log(`    <table> elements found: ${tableCount}`);
+    console.log(`    <tr> elements found (any table): ${trCount}`);
+    console.log(`    total HTML length: ${htmlLength} chars`);
+    console.log(`    body text (first 500 chars): ${bodyTextSnippet.slice(0, 500).replace(/\s+/g, " ")}`);
+
+    await fs.mkdir(SCREENSHOTS_DIR, { recursive: true });
+    const screenshotPath = path.join(SCREENSHOTS_DIR, `${label.replace(/[^a-z0-9]/gi, "_")}.png`);
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    console.log(`    screenshot saved: ${screenshotPath} (check the 'Upload logs' artifact for this run)`);
+  } catch (err) {
+    console.log(`  [DIAGNOSTIC ${label}] failed to collect diagnostics:`, err);
+  }
+}
+
 async function extractListingPage(page: Page, auctionDay: string): Promise<CurrentAuctionRow[]> {
   const scrapedAt = new Date().toISOString();
   const url = page.url();
@@ -185,6 +177,10 @@ async function extractListingPage(page: Page, auctionDay: string): Promise<Curre
     });
   }
 
+  if (results.length === 0) {
+    await logDiagnostics(page, `${auctionDay}_zero_results`);
+  }
+
   return results;
 }
 
@@ -198,7 +194,8 @@ async function scrapeListing(page: Page, startUrl: string, auctionDay: string): 
     // networkidle rather than domcontentloaded — Time Left may be a
     // client-rendered countdown widget that hasn't populated yet at
     // domcontentloaded. Unverified whether this is actually necessary.
-    await page.goto(currentUrl, { waitUntil: "networkidle" });
+    const response = await page.goto(currentUrl, { waitUntil: "networkidle" });
+    console.log(`  ${auctionDay} page ${pageNum}: HTTP status ${response?.status() ?? "unknown"}`);
 
     if (await isBlockPage(page)) {
       throw new Error(`BLOCK_PAGE_DETECTED while scraping ${auctionDay} (page ${pageNum})`);
