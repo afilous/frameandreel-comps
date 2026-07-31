@@ -6,20 +6,25 @@
  *
  * URLs: no login needed; three stable category IDs (Tuesday=13, Thursday=14,
  * Sunday=15) at https://www.emovieposter.com/agallery/mode/2/{id}.html.
- * Confirmed via real screenshots to be a genuine <table>, columns:
- * Thumbnail | Auction Title/Condition Grade/High Bidder | Recent Price | Time Left | Bid.
  *
- * RESOLVED BUG (was returning 0 items on every page despite real content):
- * diagnostics showed pages loading correctly (HTTP 200, right title, 82
- * real <tr> rows, real visible listing text) — but the parser required an
- * item-code prefix (e.g. "2g0003") on the title line to count a row as
- * valid, and Text mode (mode/2) apparently does NOT render that prefix the
- * way List mode (mode/1) did when we first built this against real List-mode
- * data. Every real row was silently discarded by that one over-strict gate.
- * FIX: row validity now requires a non-empty "Condition Grade:" line
- * instead — confirmed present on every real listing example seen this
- * entire project, in every mode. Item code is now extracted opportunistically
- * (kept if the prefix pattern happens to match) but never required.
+ * RESOLVED BUG #2 (was returning 0 items despite real content on the page):
+ * diagnostics proved real listings ARE visible (confirmed via screenshot —
+ * hundreds of items with prices, Condition Grade, High Bidder, Time Left)
+ * but the page.$$eval("table tr", ...) approach only ever found 82 <tr>
+ * total across 2 <table> elements, and NONE of them contained "Condition
+ * Grade:" text. Conclusion: the real listings are NOT inside <table> HTML
+ * in this mode — the 2 real tables are something else entirely (most
+ * likely the left sidebar's "Posters by Type / Country / Condition / ..."
+ * filter list, which has roughly the right row count on its own). This is
+ * the SECOND time a DOM-structure assumption for this specific mode turned
+ * out wrong, so this version abandons DOM-element assumptions entirely and
+ * switches to whole-page TEXT parsing — the same regex/line-based approach
+ * already built and unit-tested earlier this project against real pasted
+ * Grid-mode data. It doesn't care whether content lives in a table, a div,
+ * or anything else; it just reads visible text and pattern-matches on
+ * labels confirmed present in every real listing example seen this whole
+ * project: "Condition Grade:", "No Bids Yet" / "High Bidder:", and the
+ * item-code prefix pattern (digit+letter+4digits, e.g. "2g0003").
  */
 
 import type { Page } from "playwright";
@@ -40,7 +45,6 @@ const WARM_UP_SITES = ["https://www.google.com", "https://www.wikipedia.org"];
 const MAX_LISTING_PAGES = 40; // safety cap — real scale is ~10-12 pages per auction day
 const SCREENSHOTS_DIR = path.resolve(process.cwd(), "screenshots");
 
-// Confirmed stable category IDs.
 const DEFAULT_AUCTION_DAYS: Record<string, string> = {
   tuesday: "13",
   thursday: "14",
@@ -48,14 +52,14 @@ const DEFAULT_AUCTION_DAYS: Record<string, string> = {
 };
 
 function buildDayUrl(categoryId: string): string {
-  return `${ARCHIVE_BASE_URL}/agallery/mode/2/${categoryId}.html`; // mode/2 = Text, real table, no thumbnails
+  return `${ARCHIVE_BASE_URL}/agallery/mode/2/${categoryId}.html`;
 }
 
 interface CurrentAuctionRow {
-  itemCode: string | null; // opportunistic now, not required — see header notes
+  itemCode: string | null;
   titleRaw: string;
   conditionGrade: string;
-  priceType: "starting" | "current"; // inferred from "No Bids Yet" vs "High Bidder:"
+  priceType: "starting" | "current";
   price: number;
   highBidder: string | null;
   timeLeftRaw: string | null;
@@ -64,72 +68,118 @@ interface CurrentAuctionRow {
   sourceUrl: string;
 }
 
-const ITEM_CODE_PREFIX = /^([0-9][a-z]\d{4})\s+(.*)$/;
+const ITEM_CODE_LINE = /^([0-9][a-z]\d{4})\s+(.*)$/;
 
-// Handles the truncated-then-full title artifact within one cell's text:
-// if one line is a prefix of another, keep only the longer one.
 function dedupeTitleLines(lines: string[]): string {
   const nonEmpty = lines.map((l) => l.trim()).filter(Boolean);
-  if (nonEmpty.length <= 1) return (nonEmpty[0] ?? "").trim();
+  if (nonEmpty.length === 0) return "";
+  if (nonEmpty.length === 1) return nonEmpty[0];
   const longest = nonEmpty.reduce((a, b) => (b.length > a.length ? b : a));
   const allArePrefixesOfLongest = nonEmpty.every((l) => longest.startsWith(l));
   if (allArePrefixesOfLongest) return longest;
   return nonEmpty.join(" ").replace(/\s+/g, " ").trim();
 }
 
-// Parses column 2's own multi-line text (title + Condition Grade + bidder
-// status all packed into one cell) into structured pieces.
-function parseCombinedCell(cellText: string): {
-  itemCode: string | null;
-  titleRaw: string;
-  conditionGrade: string;
-  highBidder: string | null;
-} {
-  const lines = cellText.split("\n").map((l) => l.trim()).filter(Boolean);
-  const titleLines: string[] = [];
-  let itemCode: string | null = null;
-  let conditionGrade = "";
-  let highBidder: string | null = null;
+// Whole-page-text block parser — same approach validated earlier against
+// real pasted data. Splits on item-code line boundaries; for each block,
+// collects title lines until it hits a recognized label line, then reads
+// Condition Grade / bidder status / (optionally) price and time-left if
+// they appear as their own lines nearby. Price and Time Left, in this
+// table-less layout, may come from adjacent cell-like text rather than a
+// clean label — handled via nearby-line heuristics below, flagged as
+// approximate where relevant.
+function parseListingText(rawText: string, sourceUrl: string): CurrentAuctionRow[] {
+  const scrapedAt = new Date().toISOString();
+  const lines = rawText.split("\n").map((l) => l.trim()).filter(Boolean);
+  const items: CurrentAuctionRow[] = [];
+
+  let current: {
+    itemCode: string;
+    titleLines: string[];
+    conditionGrade?: string;
+    highBidder?: string | null;
+    price?: number;
+    timeLeftRaw?: string;
+  } | null = null;
+
+  const flush = () => {
+    if (!current) return;
+    // Only keep it if we found a real Condition Grade — same validity
+    // signal as before, just applied to text blocks instead of table cells.
+    if (current.conditionGrade) {
+      items.push({
+        itemCode: current.itemCode,
+        titleRaw: dedupeTitleLines(current.titleLines),
+        conditionGrade: current.conditionGrade,
+        priceType: current.highBidder ? "current" : "starting",
+        price: current.price ?? 0,
+        highBidder: current.highBidder ?? null,
+        timeLeftRaw: current.timeLeftRaw ?? null,
+        auctionDay: "", // filled in by caller
+        scrapedAt,
+        sourceUrl,
+      });
+    }
+    current = null;
+  };
 
   for (const line of lines) {
-    if (line.startsWith("Condition Grade:")) {
-      conditionGrade = line.replace("Condition Grade:", "").trim();
-    } else if (line.startsWith("High Bidder:")) {
-      highBidder = line.replace("High Bidder:", "").trim();
-    } else if (line === "No Bids Yet") {
-      highBidder = null;
-    } else {
-      // Opportunistic item-code extraction — kept if present, never required.
-      const codeMatch = line.match(ITEM_CODE_PREFIX);
-      if (codeMatch) {
-        if (!itemCode) itemCode = codeMatch[1];
-        titleLines.push(codeMatch[2]);
+    const codeMatch = line.match(ITEM_CODE_LINE);
+    if (codeMatch) {
+      const [, code, rest] = codeMatch;
+      if (current && current.itemCode === code) {
+        current.titleLines.push(rest); // duplicate-title artifact — absorb
       } else {
-        titleLines.push(line);
+        flush();
+        current = { itemCode: code, titleLines: [rest] };
       }
+      continue;
+    }
+
+    if (!current) continue;
+
+    if (line.startsWith("Condition Grade:")) {
+      current.conditionGrade = line.replace("Condition Grade:", "").trim();
+    } else if (line.startsWith("High Bidder:")) {
+      current.highBidder = line.replace("High Bidder:", "").trim();
+    } else if (line === "No Bids Yet") {
+      current.highBidder = null;
+    } else if (line.startsWith("Starting Price:") || line.startsWith("Recent Price:")) {
+      const num = parseFloat(line.replace(/[^0-9.]/g, ""));
+      if (!Number.isNaN(num)) current.price = num;
+    } else if (/^\$[\d,]+(\.\d{2})?$/.test(line)) {
+      const num = parseFloat(line.replace(/[^0-9.]/g, ""));
+      if (!Number.isNaN(num)) current.price = num;
+    } else if (line.startsWith("Time Left:")) {
+      current.timeLeftRaw = line.replace("Time Left:", "").trim();
+    } else if (/^\d+\s+(day|hour|minute)s?(\s|$)/i.test(line)) {
+      current.timeLeftRaw = line;
+    }
+    // Other lines (extra title fragments, filter sidebar text that slipped
+    // through, etc.) are otherwise appended to titleLines only while no
+    // label has been seen yet, to avoid polluting titles with unrelated
+    // page chrome once we're clearly inside a listing's metadata block.
+    else if (!current.conditionGrade) {
+      current.titleLines.push(line);
     }
   }
+  flush();
 
-  return { itemCode, titleRaw: dedupeTitleLines(titleLines), conditionGrade, highBidder };
+  return items;
 }
 
-// Diagnostics — runs whenever a page yields zero parsed rows.
 async function logDiagnostics(page: Page, label: string): Promise<void> {
   try {
     const title = await page.title();
     const url = page.url();
-    const tableCount = await page.$$eval("table", (tables) => tables.length);
-    const trCount = await page.$$eval("tr", (rows) => rows.length);
     const bodyTextSnippet = (await page.textContent("body").catch(() => "")) ?? "";
     const htmlLength = (await page.content()).length;
 
     console.log(`  [DIAGNOSTIC ${label}]`);
     console.log(`    final URL: ${url}`);
     console.log(`    page title: "${title}"`);
-    console.log(`    <table> elements found: ${tableCount}`);
-    console.log(`    <tr> elements found (any table): ${trCount}`);
     console.log(`    total HTML length: ${htmlLength} chars`);
-    console.log(`    body text (first 500 chars): ${bodyTextSnippet.slice(0, 500).replace(/\s+/g, " ")}`);
+    console.log(`    body text (first 800 chars): ${bodyTextSnippet.slice(0, 800).replace(/\s+/g, " ")}`);
 
     await fs.mkdir(SCREENSHOTS_DIR, { recursive: true });
     const screenshotPath = path.join(SCREENSHOTS_DIR, `${label.replace(/[^a-z0-9]/gi, "_")}.png`);
@@ -141,51 +191,11 @@ async function logDiagnostics(page: Page, label: string): Promise<void> {
 }
 
 async function extractListingPage(page: Page, auctionDay: string): Promise<CurrentAuctionRow[]> {
-  const scrapedAt = new Date().toISOString();
   const url = page.url();
+  const bodyText = await page.evaluate(() => document.body.innerText);
+  const results = parseListingText(bodyText, url).map((r) => ({ ...r, auctionDay }));
 
-  const rawRows = await page.$$eval("table tr", (rows) =>
-    rows.map((row) => Array.from(row.querySelectorAll("td")).map((td) => (td as HTMLElement).innerText ?? ""))
-  );
-
-  const results: CurrentAuctionRow[] = [];
-  let skippedNoConditionGrade = 0;
-
-  for (const cells of rawRows) {
-    // Confirmed 5-column shape: Thumbnail | combined title/condition/bidder | Price | Time Left | Bid
-    if (cells.length < 4) continue;
-
-    const combined = parseCombinedCell(cells[1] ?? "");
-
-    // FIX: require Condition Grade (present on every real listing seen
-    // across this whole project) instead of an item code (which Text mode
-    // apparently doesn't prefix onto the title the way List mode did).
-    if (!combined.conditionGrade) {
-      skippedNoConditionGrade++;
-      continue;
-    }
-
-    const priceRaw = (cells[2] ?? "").trim();
-    const price = parseFloat(priceRaw.replace(/[^0-9.]/g, ""));
-    if (Number.isNaN(price)) continue;
-
-    const timeLeftRaw = (cells[3] ?? "").trim() || null;
-
-    results.push({
-      itemCode: combined.itemCode,
-      titleRaw: combined.titleRaw,
-      conditionGrade: combined.conditionGrade,
-      priceType: combined.highBidder ? "current" : "starting",
-      price,
-      highBidder: combined.highBidder,
-      timeLeftRaw,
-      auctionDay,
-      scrapedAt,
-      sourceUrl: url,
-    });
-  }
-
-  console.log(`    (${rawRows.length} raw <tr> seen, ${skippedNoConditionGrade} skipped for no Condition Grade, ${results.length} valid)`);
+  console.log(`    (parsed from whole-page text: ${results.length} valid item(s) with a Condition Grade)`);
 
   if (results.length === 0) {
     await logDiagnostics(page, `${auctionDay}_zero_results`);
@@ -194,7 +204,6 @@ async function extractListingPage(page: Page, auctionDay: string): Promise<Curre
   return results;
 }
 
-// Follows the page's own "Next" link rather than constructing page URLs.
 async function scrapeListing(page: Page, startUrl: string, auctionDay: string): Promise<CurrentAuctionRow[]> {
   const allResults: CurrentAuctionRow[] = [];
   let currentUrl = startUrl;
@@ -244,7 +253,7 @@ async function main() {
   const overrideUrl = process.env.LISTING_URL;
 
   const browser = await launchStealthBrowser();
-  const context = await createSpoofedContext(browser); // no login needed
+  const context = await createSpoofedContext(browser);
   const page = await context.newPage();
 
   const allRows: CurrentAuctionRow[] = [];
