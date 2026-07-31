@@ -1,0 +1,48 @@
+name: eMoviePoster curl Diagnostic
+
+# One-off diagnostic — NOT part of the main scraper. Tests whether a plain
+# curl request (no browser, no JS, no Playwright) from GitHub Actions'
+# network gets the same reduced content our Playwright runs have been
+# getting, or the full real listing content a real browser gets. This
+# isolates "is it Playwright specifically" from "is it GitHub Actions'
+# datacenter IP being treated differently than a residential IP" — since
+# curl uses the exact same network/IP as our failing Playwright runs, but a
+# completely different request mechanism.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  curl-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch with plain curl (browser-like User-Agent)
+        run: |
+          curl -sL \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
+            -H "Accept-Language: en-US,en;q=0.9" \
+            "https://www.emovieposter.com/agallery/mode/2/13.html" \
+            -o response.html
+
+          echo "=== Response size ==="
+          wc -c response.html
+
+          echo ""
+          echo "=== Occurrences of 'Condition Grade' (real listings marker) ==="
+          grep -o "Condition Grade" response.html | wc -l
+
+          echo ""
+          echo "=== Occurrences of table.small_gal (the real results table) ==="
+          grep -o "small_gal" response.html | wc -l
+
+          echo ""
+          echo "=== First 2000 chars ==="
+          head -c 2000 response.html
+
+      - name: Upload full response for inspection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: curl-response
+          path: response.html
