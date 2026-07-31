@@ -36,7 +36,6 @@ import {
   createSpoofedContext,
   warmUp,
   withRetries,
-  ingestToBackend,
   isBlockPage,
   sleepJittered,
 } from "./lib/scrape-core";
@@ -234,28 +233,60 @@ async function scrapeListing(page: Page, startUrl: string, auctionDay: string): 
   return allResults;
 }
 
+// Writes directly to Supabase's REST API (current_auction_watch table) —
+// same anon-key pattern already proven working for bid_watchlist, no
+// custom backend endpoint needed. Batches inserts since Supabase/PostgREST
+// handles large single POSTs poorly; a few thousand rows in one request is
+// asking for trouble.
+const SUPABASE_INSERT_BATCH_SIZE = 500;
+
 async function upsertCurrentAuctions(rows: CurrentAuctionRow[]): Promise<void> {
   if (rows.length === 0) return;
 
-  // Skip quietly (not a failure) if no destination is configured yet — this
-  // is expected during testing/verification, not an error. Previously this
-  // threw, retried twice, then hard-failed the whole run with exit code 1,
-  // marking a fully-successful scrape as "failed" in GitHub Actions purely
-  // because persistence isn't wired up yet.
-  const endpoint = process.env.FRAMEANDREEL_INGEST_URL_CURRENT_AUCTIONS;
-  const apiKey = process.env.FRAMEANDREEL_INGEST_KEY;
-  if (!endpoint || !apiKey) {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_ANON_KEY;
+
+  // Skip quietly (not a failure) if no destination is configured — this is
+  // expected during testing/verification, not an error. A prior version of
+  // this function threw on missing config, which hard-failed a fully
+  // successful scrape run purely because persistence wasn't wired up yet.
+  if (!supabaseUrl || !supabaseKey) {
     console.log(
-      `Skipping ingest — FRAMEANDREEL_INGEST_URL_CURRENT_AUCTIONS/FRAMEANDREEL_INGEST_KEY not configured. ${rows.length} row(s) were found and logged above but not persisted anywhere.`
+      `Skipping ingest — SUPABASE_URL/SUPABASE_ANON_KEY not configured. ${rows.length} row(s) were found and logged above but not persisted anywhere.`
     );
     return;
   }
 
-  await ingestToBackend("FRAMEANDREEL_INGEST_URL_CURRENT_AUCTIONS", "FRAMEANDREEL_INGEST_KEY", {
-    source: "emovieposter_current",
-    captureMethod: "automated_scrape",
-    auctions: rows,
-  });
+  const payloadRows = rows.map((r) => ({
+    item_code: r.itemCode,
+    title_raw: r.titleRaw,
+    condition_grade: r.conditionGrade,
+    price_type: r.priceType,
+    price: r.price,
+    high_bidder: r.highBidder,
+    time_left_raw: r.timeLeftRaw,
+    auction_day: r.auctionDay,
+    scraped_at: r.scrapedAt,
+    source_url: r.sourceUrl,
+  }));
+
+  for (let i = 0; i < payloadRows.length; i += SUPABASE_INSERT_BATCH_SIZE) {
+    const batch = payloadRows.slice(i, i + SUPABASE_INSERT_BATCH_SIZE);
+    const res = await fetch(`${supabaseUrl}/rest/v1/current_auction_watch`, {
+      method: "POST",
+      headers: {
+        apikey: supabaseKey,
+        Authorization: `Bearer ${supabaseKey}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify(batch),
+    });
+    if (!res.ok) {
+      throw new Error(`Supabase insert failed (batch starting at ${i}): ${res.status} ${await res.text()}`);
+    }
+    console.log(`  inserted rows ${i + 1}-${i + batch.length} of ${payloadRows.length}`);
+  }
 }
 
 async function main() {
