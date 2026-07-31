@@ -109,8 +109,8 @@ jobs:
         if: github.event_name == 'schedule' || github.event.inputs.target == 'emovieposter-current'
         env:
           LISTING_URL: ${{ github.event.inputs.listing_url }}
-          FRAMEANDREEL_INGEST_URL_CURRENT_AUCTIONS: ${{ secrets.FRAMEANDREEL_INGEST_URL_CURRENT_AUCTIONS }}
-          FRAMEANDREEL_INGEST_KEY: ${{ secrets.FRAMEANDREEL_INGEST_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: npx tsx Scraper/emovieposter_current_auctions.ts
 
       - name: Run — eMoviePoster (tag discovery)
