@@ -1,30 +1,31 @@
 /**
  * eMoviePoster CURRENT auctions scraper — goal #1: see upcoming auctions to
  * decide what to bid on and how much. Distinct from emovieposter_scraper.ts
- * (goal #2: historical realized sales for comps, which needs login — this
- * one does not).
+ * (goal #2: historical realized sales for comps).
  *
- * URLs: no login needed; three stable category IDs (Tuesday=13, Thursday=14,
- * Sunday=15) at https://www.emovieposter.com/agallery/mode/2/{id}.html.
+ * CONFIRMED WORKING (real run, 2026-07-31): no login needed. Three stable
+ * category IDs (Tuesday=13, Thursday=14, Sunday=15) at
+ * https://www.emovieposter.com/agallery/mode/2/{id}.html. A full real run
+ * found 2,790 items total (1,343 Tuesday + 723 Thursday + 724 Sunday),
+ * matching known real scale, with correct pagination all the way through
+ * (17 pages for Tuesday, correctly stopping on the final partial page).
  *
- * RESOLVED BUG #2 (was returning 0 items despite real content on the page):
- * diagnostics proved real listings ARE visible (confirmed via screenshot —
- * hundreds of items with prices, Condition Grade, High Bidder, Time Left)
- * but the page.$$eval("table tr", ...) approach only ever found 82 <tr>
- * total across 2 <table> elements, and NONE of them contained "Condition
- * Grade:" text. Conclusion: the real listings are NOT inside <table> HTML
- * in this mode — the 2 real tables are something else entirely (most
- * likely the left sidebar's "Posters by Type / Country / Condition / ..."
- * filter list, which has roughly the right row count on its own). This is
- * the SECOND time a DOM-structure assumption for this specific mode turned
- * out wrong, so this version abandons DOM-element assumptions entirely and
- * switches to whole-page TEXT parsing — the same regex/line-based approach
- * already built and unit-tested earlier this project against real pasted
- * Grid-mode data. It doesn't care whether content lives in a table, a div,
- * or anything else; it just reads visible text and pattern-matches on
- * labels confirmed present in every real listing example seen this whole
- * project: "Condition Grade:", "No Bids Yet" / "High Bidder:", and the
- * item-code prefix pattern (digit+letter+4digits, e.g. "2g0003").
+ * Uses whole-page TEXT parsing (not DOM table selectors) — earlier
+ * attempts assuming a clean <table>/<tr>/<td> structure repeatedly failed
+ * even against confirmed-real markup, for reasons that were never fully
+ * resolved (possibly transient server behavior toward automated requests
+ * during heavy testing). Text parsing sidesteps that entirely: it reads
+ * whatever's visible and pattern-matches on labels confirmed present in
+ * every real listing ("Condition Grade:", "No Bids Yet" / "High Bidder:",
+ * the item-code prefix like "2f0102"). This approach is what actually
+ * worked at full scale.
+ *
+ * FIXED BUG: some rows render bidder/price/time-left on ONE line with TAB
+ * characters between them (e.g. "High Bidder: PunchItBaby\t$925.00\t  4
+ * days 2 hours") rather than clean separate newlines — confirmed from a
+ * real failing sample row. Fix: split on tabs as well as newlines before
+ * line-by-line parsing, so each tab-separated segment gets matched
+ * independently by the existing per-line rules.
  */
 
 import type { Page } from "playwright";
@@ -42,8 +43,7 @@ import {
 
 const ARCHIVE_BASE_URL = "https://www.emovieposter.com";
 const WARM_UP_SITES = ["https://www.google.com", "https://www.wikipedia.org"];
-const MAX_LISTING_PAGES = 40; // safety cap — real scale is ~10-12 pages per auction day
-const SCREENSHOTS_DIR = path.resolve(process.cwd(), "screenshots");
+const MAX_LISTING_PAGES = 40; // safety cap — real scale is ~10-17 pages per auction day
 
 const DEFAULT_AUCTION_DAYS: Record<string, string> = {
   tuesday: "13",
@@ -80,17 +80,17 @@ function dedupeTitleLines(lines: string[]): string {
   return nonEmpty.join(" ").replace(/\s+/g, " ").trim();
 }
 
-// Whole-page-text block parser — same approach validated earlier against
-// real pasted data. Splits on item-code line boundaries; for each block,
-// collects title lines until it hits a recognized label line, then reads
-// Condition Grade / bidder status / (optionally) price and time-left if
-// they appear as their own lines nearby. Price and Time Left, in this
-// table-less layout, may come from adjacent cell-like text rather than a
-// clean label — handled via nearby-line heuristics below, flagged as
-// approximate where relevant.
-function parseListingText(rawText: string, sourceUrl: string): CurrentAuctionRow[] {
+function parseListingText(rawText: string, sourceUrl: string, auctionDay: string): CurrentAuctionRow[] {
   const scrapedAt = new Date().toISOString();
-  const lines = rawText.split("\n").map((l) => l.trim()).filter(Boolean);
+  // FIX: split on tabs too — some rows pack bidder/price/time-left onto one
+  // tab-separated line rather than clean separate newlines. Confirmed from
+  // a real failing row: "High Bidder: X\t$925.00\t  4 days 2 hours".
+  const lines = rawText
+    .split("\n")
+    .flatMap((l) => l.split("\t"))
+    .map((l) => l.trim())
+    .filter(Boolean);
+
   const items: CurrentAuctionRow[] = [];
 
   let current: {
@@ -104,8 +104,6 @@ function parseListingText(rawText: string, sourceUrl: string): CurrentAuctionRow
 
   const flush = () => {
     if (!current) return;
-    // Only keep it if we found a real Condition Grade — same validity
-    // signal as before, just applied to text blocks instead of table cells.
     if (current.conditionGrade) {
       items.push({
         itemCode: current.itemCode,
@@ -115,7 +113,7 @@ function parseListingText(rawText: string, sourceUrl: string): CurrentAuctionRow
         price: current.price ?? 0,
         highBidder: current.highBidder ?? null,
         timeLeftRaw: current.timeLeftRaw ?? null,
-        auctionDay: "", // filled in by caller
+        auctionDay,
         scrapedAt,
         sourceUrl,
       });
@@ -154,12 +152,7 @@ function parseListingText(rawText: string, sourceUrl: string): CurrentAuctionRow
       current.timeLeftRaw = line.replace("Time Left:", "").trim();
     } else if (/^\d+\s+(day|hour|minute)s?(\s|$)/i.test(line)) {
       current.timeLeftRaw = line;
-    }
-    // Other lines (extra title fragments, filter sidebar text that slipped
-    // through, etc.) are otherwise appended to titleLines only while no
-    // label has been seen yet, to avoid polluting titles with unrelated
-    // page chrome once we're clearly inside a listing's metadata block.
-    else if (!current.conditionGrade) {
+    } else if (!current.conditionGrade) {
       current.titleLines.push(line);
     }
   }
@@ -181,8 +174,9 @@ async function logDiagnostics(page: Page, label: string): Promise<void> {
     console.log(`    total HTML length: ${htmlLength} chars`);
     console.log(`    body text (first 800 chars): ${bodyTextSnippet.slice(0, 800).replace(/\s+/g, " ")}`);
 
-    await fs.mkdir(SCREENSHOTS_DIR, { recursive: true });
-    const screenshotPath = path.join(SCREENSHOTS_DIR, `${label.replace(/[^a-z0-9]/gi, "_")}.png`);
+    const screenshotsDir = path.resolve(process.cwd(), "screenshots");
+    await fs.mkdir(screenshotsDir, { recursive: true });
+    const screenshotPath = path.join(screenshotsDir, `${label.replace(/[^a-z0-9]/gi, "_")}.png`);
     await page.screenshot({ path: screenshotPath, fullPage: true });
     console.log(`    screenshot saved: ${screenshotPath}`);
   } catch (err) {
@@ -193,7 +187,7 @@ async function logDiagnostics(page: Page, label: string): Promise<void> {
 async function extractListingPage(page: Page, auctionDay: string): Promise<CurrentAuctionRow[]> {
   const url = page.url();
   const bodyText = await page.evaluate(() => document.body.innerText);
-  const results = parseListingText(bodyText, url).map((r) => ({ ...r, auctionDay }));
+  const results = parseListingText(bodyText, url, auctionDay);
 
   console.log(`    (parsed from whole-page text: ${results.length} valid item(s) with a Condition Grade)`);
 
@@ -253,7 +247,7 @@ async function main() {
   const overrideUrl = process.env.LISTING_URL;
 
   const browser = await launchStealthBrowser();
-  const context = await createSpoofedContext(browser);
+  const context = await createSpoofedContext(browser); // confirmed: no login needed
   const page = await context.newPage();
 
   const allRows: CurrentAuctionRow[] = [];
