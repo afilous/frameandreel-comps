@@ -4,42 +4,61 @@
  * (goal #2: historical realized sales for comps, which needs login — this
  * one does not).
  *
- * CONFIRMED (from real screenshots + pasted List-mode table output):
+ * CONFIRMED (from real screenshots):
  *   - No login required.
- *   - "All Auctions" aggregates every current auction under ONE stable URL:
- *       https://www.emovieposter.com/agallery/all.html
- *     Confirmed via a real screenshot showing 2,069 items = 1,345 (Tuesday
- *     "flat") + 724 (Thursday "rolled") combined. No auction-cycle-specific
- *     ID in this URL, unlike the earlier mode/1/{id} per-day links — this
- *     appears stable across cycles and is now the default (see main()).
- *     Per-day URLs (mode/1/{id}.html, e.g. .../mode/1/14.html for Thursday)
- *     still exist if you want just one day, but aren't needed for the
- *     common case of "show me everything up for bid right now."
- *   - Real table structure confirmed via visible header row, same on both
- *     all.html and the per-day mode/1 pages:
+ *   - Three separate, STABLE per-day category IDs (confirmed directly):
+ *       Tuesday = 13, Thursday = 14, Sunday = 15
+ *     URL pattern: https://www.emovieposter.com/agallery/mode/2/{id}.html
+ *     (mode/2 = Text — no thumbnails, real <table> markup, lightest fetch;
+ *     mode/0 = Grid is the default with thumbnails; mode/1 = List, also a
+ *     real table but with thumbnails. Each mode has a DIFFERENT URL, not
+ *     just a display toggle — confirmed directly.)
+ *   - https://www.emovieposter.com/agallery/all.html — the "aggregate
+ *     everything" page — returns a REAL page (confirmed via screenshot,
+ *     2,069 items = Tuesday + Thursday combined) but the scraper found
+ *     ZERO table rows on it in an actual run. Likely uses a different
+ *     underlying template (div/card-based) than the per-day mode/2 pages,
+ *     even though it displays similarly. NOT used as the default anymore
+ *     — hitting the three known per-day IDs directly is more reliable.
+ *   - Real table structure confirmed via visible header row, consistent
+ *     across all per-day pages regardless of mode:
  *       Thumbnail | Auction Title/Condition Grade/High Bidder | Recent Price | Time Left | Bid
  *     5 columns. Column 2 packs title + condition grade + bidder status
  *     into one cell as multi-line text (not 3 separate cells) — parsed by
  *     splitting that cell's own text, not the whole page's.
- *   - No "Starting Price:"/"Recent Price:" labels in this table — just a
- *     bare "$1.00" in its own column. Whether that's a starting price or
- *     an actual bid can only be inferred from the adjacent status line
- *     ("No Bids Yet" vs "High Bidder: {name}").
+ *   - No "Starting Price:"/"Recent Price:" labels — just a bare "$1.00" in
+ *     its own column. Whether that's a starting price or an actual bid can
+ *     only be inferred from the adjacent status line ("No Bids Yet" vs
+ *     "High Bidder: {name}").
  *   - Item codes match the pattern seen everywhere on the site: digit +
- *     letter + 4 digits (e.g. "2g0003", "2f0009").
+ *     letter + 4 digits (e.g. "2f0083", "2f0229").
  *   - The duplicate-title-line artifact (an apostrophe splitting an <img>
  *     alt from a separate link's full text) still shows up within column
  *     2's own text — handled the same way as before (keep the longer line
  *     if one is a prefix of the other).
+ *   - Items-per-page dropdown (40/80/120/160/200) is a real, separate
+ *     per-mode setting — text mode showed 160 as the current selection in
+ *     one screenshot vs 80 for grid mode, so this may reset per mode
+ *     rather than persisting; not something this scraper controls, it
+ *     just reads whatever the default renders.
  *
  * STILL OPEN:
+ *   - Whether IDs 13/14/15 are truly PERMANENT (stable across many future
+ *     auction cycles) or just happen to be stable right now — worth
+ *     rechecking occasionally, especially around special/major auctions
+ *     (the calendar mentioned "August Major Auction", "Elvis auction" etc.
+ *     which might use different IDs than the regular weekly 13/14/15)
+ *   - Real pagination URL pattern for these pages — not yet confirmed
+ *     (does page 2 add a /page/{n}/ segment like the historical archive,
+ *     or something else?) — still following the page's own "Next" link
+ *     rather than guessing, which doesn't depend on knowing this
  *   - Whether Time Left actually appears in the DOM at scrape time, or is
- *     rendered by client-side JS after a delay (a countdown widget) —
- *     using 'networkidle' wait to be safe, but unverified
- *   - Real pagination URL pattern — likely simpler now that this is a
- *     stable URL, but not yet confirmed (does page 2 add a segment, or is
- *     it a different querystring?) — currently follows the page's own
- *     "Next" link rather than guessing
+ *     rendered by client-side JS after a delay — using 'networkidle' wait
+ *     to be safe, but unverified
+ *
+ * Does NOT compute suggested_max_bid — that's the valuation engine's job,
+ * comparing against poster_auctions history. This scraper only collects
+ * what's currently up for bid. Read-only throughout: never places a bid.
  */
 
 import type { Page } from "playwright";
@@ -53,8 +72,20 @@ import {
   sleepJittered,
 } from "./lib/scrape-core";
 
+const ARCHIVE_BASE_URL = "https://www.emovieposter.com";
 const WARM_UP_SITES = ["https://www.google.com", "https://www.wikipedia.org"];
 const MAX_LISTING_PAGES = 40; // safety cap — real scale is ~10-12 pages per auction day
+
+// Confirmed stable category IDs — see header notes above.
+const DEFAULT_AUCTION_DAYS: Record<string, string> = {
+  tuesday: "13",
+  thursday: "14",
+  sunday: "15",
+};
+
+function buildDayUrl(categoryId: string): string {
+  return `${ARCHIVE_BASE_URL}/agallery/mode/2/${categoryId}.html`; // mode/2 = Text, real table, no thumbnails
+}
 
 interface CurrentAuctionRow {
   itemCode: string;
@@ -64,6 +95,7 @@ interface CurrentAuctionRow {
   price: number;
   highBidder: string | null;
   timeLeftRaw: string | null; // null if not present in the DOM at scrape time — see header note
+  auctionDay: string;         // 'tuesday' | 'thursday' | 'sunday' | 'custom' (when LISTING_URL overrides)
   scrapedAt: string;
   sourceUrl: string;
 }
@@ -103,7 +135,6 @@ function parseCombinedCell(cellText: string): {
     } else if (line === "No Bids Yet") {
       highBidder = null;
     } else {
-      // Part of the title — extract the item code from the first such line
       const codeMatch = line.match(ITEM_CODE_PREFIX);
       if (codeMatch) {
         if (!itemCode) itemCode = codeMatch[1];
@@ -117,8 +148,9 @@ function parseCombinedCell(cellText: string): {
   return { itemCode, titleRaw: dedupeTitleLines(titleLines), conditionGrade, highBidder };
 }
 
-async function extractListingPage(page: Page, sourceUrl: string): Promise<CurrentAuctionRow[]> {
+async function extractListingPage(page: Page, auctionDay: string): Promise<CurrentAuctionRow[]> {
   const scrapedAt = new Date().toISOString();
+  const url = page.url();
 
   const rawRows = await page.$$eval("table tr", (rows) =>
     rows.map((row) => Array.from(row.querySelectorAll("td")).map((td) => (td as HTMLElement).innerText ?? ""))
@@ -147,8 +179,9 @@ async function extractListingPage(page: Page, sourceUrl: string): Promise<Curren
       price,
       highBidder: combined.highBidder,
       timeLeftRaw,
+      auctionDay,
       scrapedAt,
-      sourceUrl,
+      sourceUrl: url,
     });
   }
 
@@ -156,11 +189,10 @@ async function extractListingPage(page: Page, sourceUrl: string): Promise<Curren
 }
 
 // Follows the page's own "Next" link rather than constructing page URLs —
-// pagination pattern for this mode/1 path isn't confirmed yet.
-async function scrapeListing(page: Page, startUrl: string): Promise<CurrentAuctionRow[]> {
+// pagination pattern for these numbered category pages isn't confirmed yet.
+async function scrapeListing(page: Page, startUrl: string, auctionDay: string): Promise<CurrentAuctionRow[]> {
   const allResults: CurrentAuctionRow[] = [];
   let currentUrl = startUrl;
-  let missingTimeLeftCount = 0;
 
   for (let pageNum = 1; pageNum <= MAX_LISTING_PAGES; pageNum++) {
     // networkidle rather than domcontentloaded — Time Left may be a
@@ -169,42 +201,28 @@ async function scrapeListing(page: Page, startUrl: string): Promise<CurrentAucti
     await page.goto(currentUrl, { waitUntil: "networkidle" });
 
     if (await isBlockPage(page)) {
-      throw new Error(`BLOCK_PAGE_DETECTED while scraping current auctions (page ${pageNum})`);
+      throw new Error(`BLOCK_PAGE_DETECTED while scraping ${auctionDay} (page ${pageNum})`);
     }
 
-    const pageResults = await extractListingPage(page, currentUrl);
-    console.log(`  page ${pageNum}: ${pageResults.length} item(s) parsed`);
+    const pageResults = await extractListingPage(page, auctionDay);
+    console.log(`  ${auctionDay} page ${pageNum}: ${pageResults.length} item(s)`);
 
     if (pageResults.length === 0) {
-      console.log("  no items parsed — stopping");
+      console.log(`  ${auctionDay}: no items parsed — stopping this day's pagination`);
       break;
     }
 
-    missingTimeLeftCount += pageResults.filter((r) => r.timeLeftRaw === null).length;
     allResults.push(...pageResults);
 
     const nextLink = page.locator("a:has-text('Next')").first();
     const hasNext = (await nextLink.count()) > 0 && (await nextLink.isVisible().catch(() => false));
-    if (!hasNext) {
-      console.log("  no 'Next' link found — stopping pagination");
-      break;
-    }
+    if (!hasNext) break;
 
     const nextHref = await nextLink.getAttribute("href").catch(() => null);
-    if (!nextHref) {
-      console.log("  'Next' link had no href — stopping pagination");
-      break;
-    }
+    if (!nextHref) break;
     currentUrl = new URL(nextHref, currentUrl).toString();
 
     await sleepJittered(1200);
-  }
-
-  if (missingTimeLeftCount > 0) {
-    console.log(
-      `  WARNING: ${missingTimeLeftCount} item(s) had no Time Left value — ` +
-        `either it's client-rendered and needs a longer wait, or the column index guess is off.`
-    );
   }
 
   return allResults;
@@ -220,30 +238,47 @@ async function upsertCurrentAuctions(rows: CurrentAuctionRow[]): Promise<void> {
 }
 
 async function main() {
-  // Confirmed via screenshot: "All Auctions" aggregates every current
-  // auction (Tuesday + Thursday, e.g. 1,345 + 724 = 2,069 items) under one
-  // URL with no auction-cycle-specific ID in it — appears stable across
-  // cycles, unlike the earlier mode/1/{id} per-day links. Defaulting here
-  // so a bare run picks up everything without needing a fresh URL each
-  // time. Override LISTING_URL if you want just one specific day instead.
-  const listingUrl = process.env.LISTING_URL || "https://www.emovieposter.com/agallery/all.html";
+  // If LISTING_URL is explicitly set, use ONLY that (ad-hoc single-page
+  // testing/override) — otherwise default to hitting all three known,
+  // confirmed-stable day category IDs and combining results.
+  const overrideUrl = process.env.LISTING_URL;
 
   const browser = await launchStealthBrowser();
   const context = await createSpoofedContext(browser); // no login needed
   const page = await context.newPage();
 
+  const allRows: CurrentAuctionRow[] = [];
+
   try {
     await warmUp(page, WARM_UP_SITES);
 
-    console.log(`Scraping current auctions starting from ${listingUrl}...`);
-    const rows = await withRetries("scrape current auctions", () => scrapeListing(page, listingUrl));
-    console.log(`Found ${rows.length} current auction item(s) total.`);
-
-    if (rows.length > 0) {
-      console.log("Sample row:", JSON.stringify(rows[0], null, 2));
+    if (overrideUrl) {
+      console.log(`Scraping current auctions from override URL: ${overrideUrl}...`);
+      const rows = await withRetries("scrape current auctions (override)", () =>
+        scrapeListing(page, overrideUrl, "custom")
+      );
+      allRows.push(...rows);
+    } else {
+      for (const [day, categoryId] of Object.entries(DEFAULT_AUCTION_DAYS)) {
+        const dayUrl = buildDayUrl(categoryId);
+        console.log(`Scraping ${day} (category ${categoryId}): ${dayUrl}...`);
+        try {
+          const rows = await withRetries(`scrape ${day}`, () => scrapeListing(page, dayUrl, day));
+          console.log(`  ${day}: ${rows.length} item(s) total`);
+          allRows.push(...rows);
+        } catch (err) {
+          console.error(`  ${day} failed, continuing with remaining days:`, err);
+        }
+        await sleepJittered(1500);
+      }
     }
 
-    await withRetries("upsert current auctions", () => upsertCurrentAuctions(rows));
+    console.log(`Found ${allRows.length} current auction item(s) total across all days.`);
+    if (allRows.length > 0) {
+      console.log("Sample row:", JSON.stringify(allRows[0], null, 2));
+    }
+
+    await withRetries("upsert current auctions", () => upsertCurrentAuctions(allRows));
   } finally {
     await context.close();
     await browser.close();
