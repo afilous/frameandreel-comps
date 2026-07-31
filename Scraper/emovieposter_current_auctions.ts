@@ -4,22 +4,22 @@
  * (goal #2: historical realized sales for comps, which needs login — this
  * one does not).
  *
- * See git history / conversation for the full confirmed-structure notes.
- * Short version: no login needed; three stable category IDs (Tuesday=13,
- * Thursday=14, Sunday=15) at https://www.emovieposter.com/agallery/mode/2/{id}.html;
- * confirmed via real screenshots to be a genuine <table> with columns
+ * URLs: no login needed; three stable category IDs (Tuesday=13, Thursday=14,
+ * Sunday=15) at https://www.emovieposter.com/agallery/mode/2/{id}.html.
+ * Confirmed via real screenshots to be a genuine <table>, columns:
  * Thumbnail | Auction Title/Condition Grade/High Bidder | Recent Price | Time Left | Bid.
  *
- * CURRENT PROBLEM: three consecutive real runs against these confirmed
- * URLs all returned 0 items on every day, with no errors, no block-page
- * detection triggering, and no timeouts — meaning page.goto() succeeds and
- * $$eval("table tr", ...) finds nothing, despite screenshots showing real
- * table content at these exact URLs. Added real diagnostics below (screenshot
- * on zero-results, page title, raw HTML snippet, table-element count) since
- * guessing at another cause blind hasn't been productive — the artifact
- * upload / log output from the NEXT run should show what Playwright is
- * actually seeing (e.g. a login wall, a different template, an empty shell
- * page, a bot-check page our isBlockPage() keyword list doesn't catch).
+ * RESOLVED BUG (was returning 0 items on every page despite real content):
+ * diagnostics showed pages loading correctly (HTTP 200, right title, 82
+ * real <tr> rows, real visible listing text) — but the parser required an
+ * item-code prefix (e.g. "2g0003") on the title line to count a row as
+ * valid, and Text mode (mode/2) apparently does NOT render that prefix the
+ * way List mode (mode/1) did when we first built this against real List-mode
+ * data. Every real row was silently discarded by that one over-strict gate.
+ * FIX: row validity now requires a non-empty "Condition Grade:" line
+ * instead — confirmed present on every real listing example seen this
+ * entire project, in every mode. Item code is now extracted opportunistically
+ * (kept if the prefix pattern happens to match) but never required.
  */
 
 import type { Page } from "playwright";
@@ -40,7 +40,7 @@ const WARM_UP_SITES = ["https://www.google.com", "https://www.wikipedia.org"];
 const MAX_LISTING_PAGES = 40; // safety cap — real scale is ~10-12 pages per auction day
 const SCREENSHOTS_DIR = path.resolve(process.cwd(), "screenshots");
 
-// Confirmed stable category IDs — see header notes above.
+// Confirmed stable category IDs.
 const DEFAULT_AUCTION_DAYS: Record<string, string> = {
   tuesday: "13",
   thursday: "14",
@@ -52,14 +52,14 @@ function buildDayUrl(categoryId: string): string {
 }
 
 interface CurrentAuctionRow {
-  itemCode: string;
+  itemCode: string | null; // opportunistic now, not required — see header notes
   titleRaw: string;
   conditionGrade: string;
   priceType: "starting" | "current"; // inferred from "No Bids Yet" vs "High Bidder:"
   price: number;
   highBidder: string | null;
-  timeLeftRaw: string | null; // null if not present in the DOM at scrape time — see header note
-  auctionDay: string;         // 'tuesday' | 'thursday' | 'sunday' | 'custom' (when LISTING_URL overrides)
+  timeLeftRaw: string | null;
+  auctionDay: string;
   scrapedAt: string;
   sourceUrl: string;
 }
@@ -99,6 +99,7 @@ function parseCombinedCell(cellText: string): {
     } else if (line === "No Bids Yet") {
       highBidder = null;
     } else {
+      // Opportunistic item-code extraction — kept if present, never required.
       const codeMatch = line.match(ITEM_CODE_PREFIX);
       if (codeMatch) {
         if (!itemCode) itemCode = codeMatch[1];
@@ -112,8 +113,7 @@ function parseCombinedCell(cellText: string): {
   return { itemCode, titleRaw: dedupeTitleLines(titleLines), conditionGrade, highBidder };
 }
 
-// Diagnostics — runs whenever a page yields zero parsed rows, so we get
-// real visibility into what Playwright actually saw instead of guessing.
+// Diagnostics — runs whenever a page yields zero parsed rows.
 async function logDiagnostics(page: Page, label: string): Promise<void> {
   try {
     const title = await page.title();
@@ -134,7 +134,7 @@ async function logDiagnostics(page: Page, label: string): Promise<void> {
     await fs.mkdir(SCREENSHOTS_DIR, { recursive: true });
     const screenshotPath = path.join(SCREENSHOTS_DIR, `${label.replace(/[^a-z0-9]/gi, "_")}.png`);
     await page.screenshot({ path: screenshotPath, fullPage: true });
-    console.log(`    screenshot saved: ${screenshotPath} (check the 'Upload logs' artifact for this run)`);
+    console.log(`    screenshot saved: ${screenshotPath}`);
   } catch (err) {
     console.log(`  [DIAGNOSTIC ${label}] failed to collect diagnostics:`, err);
   }
@@ -149,13 +149,21 @@ async function extractListingPage(page: Page, auctionDay: string): Promise<Curre
   );
 
   const results: CurrentAuctionRow[] = [];
+  let skippedNoConditionGrade = 0;
 
   for (const cells of rawRows) {
     // Confirmed 5-column shape: Thumbnail | combined title/condition/bidder | Price | Time Left | Bid
     if (cells.length < 4) continue;
 
     const combined = parseCombinedCell(cells[1] ?? "");
-    if (!combined.itemCode) continue; // header row or malformed row — skip
+
+    // FIX: require Condition Grade (present on every real listing seen
+    // across this whole project) instead of an item code (which Text mode
+    // apparently doesn't prefix onto the title the way List mode did).
+    if (!combined.conditionGrade) {
+      skippedNoConditionGrade++;
+      continue;
+    }
 
     const priceRaw = (cells[2] ?? "").trim();
     const price = parseFloat(priceRaw.replace(/[^0-9.]/g, ""));
@@ -177,6 +185,8 @@ async function extractListingPage(page: Page, auctionDay: string): Promise<Curre
     });
   }
 
+  console.log(`    (${rawRows.length} raw <tr> seen, ${skippedNoConditionGrade} skipped for no Condition Grade, ${results.length} valid)`);
+
   if (results.length === 0) {
     await logDiagnostics(page, `${auctionDay}_zero_results`);
   }
@@ -184,16 +194,12 @@ async function extractListingPage(page: Page, auctionDay: string): Promise<Curre
   return results;
 }
 
-// Follows the page's own "Next" link rather than constructing page URLs —
-// pagination pattern for these numbered category pages isn't confirmed yet.
+// Follows the page's own "Next" link rather than constructing page URLs.
 async function scrapeListing(page: Page, startUrl: string, auctionDay: string): Promise<CurrentAuctionRow[]> {
   const allResults: CurrentAuctionRow[] = [];
   let currentUrl = startUrl;
 
   for (let pageNum = 1; pageNum <= MAX_LISTING_PAGES; pageNum++) {
-    // networkidle rather than domcontentloaded — Time Left may be a
-    // client-rendered countdown widget that hasn't populated yet at
-    // domcontentloaded. Unverified whether this is actually necessary.
     const response = await page.goto(currentUrl, { waitUntil: "networkidle" });
     console.log(`  ${auctionDay} page ${pageNum}: HTTP status ${response?.status() ?? "unknown"}`);
 
@@ -235,9 +241,6 @@ async function upsertCurrentAuctions(rows: CurrentAuctionRow[]): Promise<void> {
 }
 
 async function main() {
-  // If LISTING_URL is explicitly set, use ONLY that (ad-hoc single-page
-  // testing/override) — otherwise default to hitting all three known,
-  // confirmed-stable day category IDs and combining results.
   const overrideUrl = process.env.LISTING_URL;
 
   const browser = await launchStealthBrowser();
