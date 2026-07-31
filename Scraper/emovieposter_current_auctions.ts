@@ -236,6 +236,21 @@ async function scrapeListing(page: Page, startUrl: string, auctionDay: string): 
 
 async function upsertCurrentAuctions(rows: CurrentAuctionRow[]): Promise<void> {
   if (rows.length === 0) return;
+
+  // Skip quietly (not a failure) if no destination is configured yet — this
+  // is expected during testing/verification, not an error. Previously this
+  // threw, retried twice, then hard-failed the whole run with exit code 1,
+  // marking a fully-successful scrape as "failed" in GitHub Actions purely
+  // because persistence isn't wired up yet.
+  const endpoint = process.env.FRAMEANDREEL_INGEST_URL_CURRENT_AUCTIONS;
+  const apiKey = process.env.FRAMEANDREEL_INGEST_KEY;
+  if (!endpoint || !apiKey) {
+    console.log(
+      `Skipping ingest — FRAMEANDREEL_INGEST_URL_CURRENT_AUCTIONS/FRAMEANDREEL_INGEST_KEY not configured. ${rows.length} row(s) were found and logged above but not persisted anywhere.`
+    );
+    return;
+  }
+
   await ingestToBackend("FRAMEANDREEL_INGEST_URL_CURRENT_AUCTIONS", "FRAMEANDREEL_INGEST_KEY", {
     source: "emovieposter_current",
     captureMethod: "automated_scrape",
