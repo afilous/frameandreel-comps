@@ -33,9 +33,9 @@ on:
         required: false
         default: ""
       listing_url:
-        description: "For emovieposter-current — defaults to the 'All Auctions' listing, which aggregates every current auction and appears stable across cycles (no per-cycle ID). Override only if you want just one specific day."
+        description: "For emovieposter-current — LEAVE BLANK to scrape all 3 known auction days automatically (Tuesday/Thursday/Sunday, category IDs 13/14/15, confirmed stable). Only set this if you want ONE specific URL instead (overrides the 3-day default entirely)."
         required: false
-        default: "https://www.emovieposter.com/agallery/all.html"
+        default: ""
       # gemini-estimate single-item inputs
       title:
         description: "Single title (for gemini-estimate)"
